@@ -1,0 +1,641 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p 'app'
+          cat > 'app/build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.lessonwidget"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.lessonwidget"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          __EOF__
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".LessonWidgetProvider"
+                      android:exported="true"
+                      android:label="@string/widget_name">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.TIME_SET" />
+                          <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                          <action android:name="com.example.lessonwidget.REFRESH" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/lesson_widget_info" />
+                  </receiver>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p 'app/src/main/java/com/example/lessonwidget'
+          cat > 'app/src/main/java/com/example/lessonwidget/LessonWidgetProvider.kt' <<'__EOF__'
+          package com.example.lessonwidget
+
+          import android.app.AlarmManager
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.view.View
+          import android.widget.RemoteViews
+          import java.time.Duration
+          import java.time.LocalDateTime
+          import java.time.ZoneId
+
+          class LessonWidgetProvider : AppWidgetProvider() {
+
+              override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
+                  updateAll(context)
+              }
+
+              override fun onEnabled(context: Context) {
+                  updateAll(context)
+              }
+
+              override fun onDisabled(context: Context) {
+                  alarmManager(context).cancel(refreshIntent(context))
+              }
+
+              override fun onReceive(context: Context, intent: Intent) {
+                  super.onReceive(context, intent)
+                  when (intent.action) {
+                      Intent.ACTION_BOOT_COMPLETED,
+                      Intent.ACTION_TIME_CHANGED,
+                      Intent.ACTION_TIMEZONE_CHANGED,
+                      Intent.ACTION_MY_PACKAGE_REPLACED,
+                      ACTION_REFRESH -> updateAll(context)
+                  }
+              }
+
+              companion object {
+                  const val ACTION_REFRESH = "com.example.lessonwidget.REFRESH"
+                  private val DAY_SHORT = arrayOf("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+                  fun updateAll(context: Context) {
+                      val app = context.applicationContext
+                      val manager = AppWidgetManager.getInstance(app)
+                      val ids = manager.getAppWidgetIds(ComponentName(app, LessonWidgetProvider::class.java))
+                      if (ids.isEmpty()) return
+
+                      val now = LocalDateTime.now()
+                      val state = Schedule.current(Schedule.parse(Schedule.load(app)), now)
+                      manager.updateAppWidget(ids, buildViews(app, state, now))
+                      scheduleNext(app, state)
+                  }
+
+                  private fun buildViews(ctx: Context, state: WidgetState?, now: LocalDateTime): RemoteViews {
+                      val views = RemoteViews(ctx.packageName, R.layout.widget_lesson)
+
+                      if (state == null) {
+                          views.setTextViewText(R.id.label, "Расписание")
+                          views.setTextViewText(R.id.subject, "Нет уроков")
+                          views.setTextViewText(R.id.room, "Добавьте в приложении")
+                          views.setViewVisibility(R.id.countdown, View.GONE)
+                          views.setViewVisibility(R.id.hint, View.GONE)
+                      } else {
+                          val label = when {
+                              state.ongoing -> "Сейчас идёт"
+                              state.date == now.toLocalDate() -> "Следующий урок"
+                              else -> "Следующий · " + DAY_SHORT[state.date.dayOfWeek.value - 1]
+                          }
+                          views.setTextViewText(R.id.label, label)
+                          views.setTextViewText(R.id.subject, state.lesson.subject)
+                          views.setTextViewText(
+                              R.id.room,
+                              when {
+                                  state.lesson.room.isEmpty() -> ""
+                                  state.lesson.room.all { it.isDigit() } -> "каб. " + state.lesson.room
+                                  else -> state.lesson.room
+                              },
+                          )
+
+                          val secs = Duration.between(now, state.bellAt).seconds.coerceAtLeast(0)
+                          val mins = (secs + 59) / 60
+                          views.setViewVisibility(R.id.countdown, View.VISIBLE)
+                          views.setViewVisibility(R.id.hint, View.VISIBLE)
+                          views.setTextViewText(
+                              R.id.countdown,
+                              if (mins >= 60) "%d ч %02d мин".format(mins / 60, mins % 60) else "$mins мин",
+                          )
+                      }
+
+                      val open = PendingIntent.getActivity(
+                          ctx, 0, Intent(ctx, MainActivity::class.java),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                      )
+                      views.setOnClickPendingIntent(R.id.root, open)
+                      return views
+                  }
+
+                  private fun alarmManager(ctx: Context): AlarmManager =
+                      ctx.getSystemService(AlarmManager::class.java)
+
+                  private fun refreshIntent(ctx: Context): PendingIntent {
+                      val intent = Intent(ctx, LessonWidgetProvider::class.java).setAction(ACTION_REFRESH)
+                      return PendingIntent.getBroadcast(
+                          ctx, 1, intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                      )
+                  }
+
+                  /** Будим виджет ровно в момент звонка, чтобы он переключился на следующий урок. */
+                  private fun scheduleNext(ctx: Context, state: WidgetState?) {
+                      val am = alarmManager(ctx)
+                      val pi = refreshIntent(ctx)
+                      if (state == null) {
+                          am.cancel(pi)
+                          return
+                      }
+                      val bell = state.bellAt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() + 500
+                      val nextMinute = System.currentTimeMillis() / 60000 * 60000 + 60500
+                      val triggerAt = minOf(bell, nextMinute)
+                      val exactAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || am.canScheduleExactAlarms()
+                      try {
+                          if (exactAllowed) {
+                              am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+                          } else {
+                              am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+                          }
+                      } catch (e: SecurityException) {
+                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+                      }
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p 'app/src/main/java/com/example/lessonwidget'
+          cat > 'app/src/main/java/com/example/lessonwidget/MainActivity.kt' <<'__EOF__'
+          package com.example.lessonwidget
+
+          import android.app.Activity
+          import android.appwidget.AppWidgetManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+
+                  val help = TextView(this).apply {
+                      text = "Расписание: по одному уроку в строке.\n" +
+                          "Формат: день ЧЧ:ММ-ЧЧ:ММ Предмет Кабинет\n" +
+                          "Пример: Пн 08:30-09:15 Математика 204\n" +
+                          "Последнее слово — кабинет. Дни: пн вт ср чт пт сб вс."
+                      textSize = 14f
+                  }
+
+                  val edit = EditText(this).apply {
+                      setText(Schedule.load(this@MainActivity))
+                      typeface = Typeface.MONOSPACE
+                      textSize = 13f
+                      gravity = Gravity.TOP or Gravity.START
+                      minLines = 14
+                      inputType = InputType.TYPE_CLASS_TEXT or
+                          InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                          InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                  }
+
+                  val save = Button(this).apply {
+                      text = "Сохранить расписание"
+                      setOnClickListener {
+                          val text = edit.text.toString()
+                          Schedule.save(this@MainActivity, text)
+                          LessonWidgetProvider.updateAll(this@MainActivity)
+                          val n = Schedule.parse(text).size
+                          Toast.makeText(this@MainActivity, "Сохранено уроков: $n", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  val pin = Button(this).apply {
+                      text = "Добавить виджет на рабочий стол"
+                      setOnClickListener {
+                          val mgr = getSystemService(AppWidgetManager::class.java)
+                          if (mgr.isRequestPinAppWidgetSupported) {
+                              mgr.requestPinAppWidget(
+                                  ComponentName(this@MainActivity, LessonWidgetProvider::class.java), null, null,
+                              )
+                          } else {
+                              Toast.makeText(
+                                  this@MainActivity,
+                                  "Долгий тап по рабочему столу → Виджеты → Урок-виджет",
+                                  Toast.LENGTH_LONG,
+                              ).show()
+                          }
+                      }
+                  }
+
+                  root.addView(help)
+                  root.addView(edit)
+                  root.addView(save)
+                  root.addView(pin)
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      val exact = Button(this).apply {
+                          text = "Разрешить точные будильники (для звонка секунда в секунду)"
+                          setOnClickListener {
+                              startActivity(
+                                  Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")),
+                              )
+                          }
+                      }
+                      root.addView(exact)
+                  }
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+          }
+          __EOF__
+          mkdir -p 'app/src/main/java/com/example/lessonwidget'
+          cat > 'app/src/main/java/com/example/lessonwidget/Schedule.kt' <<'__EOF__'
+          package com.example.lessonwidget
+
+          import android.content.Context
+          import java.time.DayOfWeek
+          import java.time.LocalDate
+          import java.time.LocalDateTime
+          import java.time.LocalTime
+
+          data class Lesson(
+              val day: DayOfWeek,
+              val start: LocalTime,
+              val end: LocalTime,
+              val subject: String,
+              val room: String,
+          )
+
+          /** ongoing = урок идёт сейчас (до звонка с урока), иначе ждём начала урока. */
+          data class WidgetState(
+              val ongoing: Boolean,
+              val lesson: Lesson,
+              val bellAt: LocalDateTime,
+              val date: LocalDate,
+          )
+
+          object Schedule {
+              private const val PREFS = "schedule"
+              private const val KEY = "text"
+
+              val DEFAULT = """
+          # Формат: день ЧЧ:ММ-ЧЧ:ММ Предмет (Кабинет)
+          Пн 08:10-08:50 Разговоры о важном (404)
+          Пн 09:00-09:40 Русский язык (322)
+          Пн 10:00-10:40 ОБЗР (311)
+          Пн 11:00-11:40 Алгебра (414)
+          Пн 11:55-12:35 Химия (302)
+          Пн 12:50-13:30 ТВиС (414)
+          Пн 13:40-14:20 Англ. яз. (319)
+          Пн 14:30-15:10 Трудн. вопр. рус. (322)
+          Вт 08:10-08:50 Музыка (120)
+          Вт 09:00-09:40 Биология (404)
+          Вт 10:00-10:40 Химия (302)
+          Вт 11:00-11:40 Русский язык (322)
+          Вт 11:55-12:35 Алгебра (414)
+          Вт 12:50-13:30 Геометрия (414)
+          Вт 13:40-14:20 Физкультура (зал)
+          Ср 08:10-08:50 Физика (202)
+          Ср 09:00-09:40 Русский язык (322)
+          Ср 10:00-10:40 Литература (322)
+          Ср 11:00-11:40 География (412)
+          Ср 11:55-12:35 Биология (404)
+          Ср 12:50-13:30 История (321)
+          Ср 13:40-14:20 Рус род яз (322)
+          Ср 14:30-15:10 Трудн. вопр. рус. (322)
+          Чт 08:10-08:50 Геометрия (414)
+          Чт 09:00-09:40 География (404)
+          Чт 10:00-10:40 Информатика (212)
+          Чт 11:00-11:40 Англ. яз. (319)
+          Чт 11:55-12:35 Алгебра (414)
+          Чт 12:50-13:30 История (321)
+          Чт 13:40-14:20 Физкультура (зал)
+          Чт 14:30-15:10 Англ. культура (319)
+          Пт 08:10-08:50 Литература (322)
+          Пт 09:00-09:40 История (321)
+          Пт 10:00-10:40 Физика (202)
+          Пт 11:00-11:40 Англ. яз. (319)
+          Пт 11:55-12:35 Алгебра (414)
+          Пт 12:50-13:30 Технология (211)
+          Пт 13:40-14:20 Сложн. вопр. мат. (404)
+          Пт 14:30-15:10 Практикум инф. (212)
+          """.trimIndent()
+
+              private val LINE = Regex("""^(\S+)\s+(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})\s+(.+)$""")
+
+              fun load(ctx: Context): String =
+                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, DEFAULT) ?: DEFAULT
+
+              fun save(ctx: Context, text: String) {
+                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, text).apply()
+              }
+
+              private fun dayOf(raw: String): DayOfWeek? {
+                  val s = raw.lowercase()
+                  return when {
+                      s.startsWith("пн") || s.startsWith("пон") -> DayOfWeek.MONDAY
+                      s.startsWith("вт") -> DayOfWeek.TUESDAY
+                      s.startsWith("ср") -> DayOfWeek.WEDNESDAY
+                      s.startsWith("чт") || s.startsWith("чет") -> DayOfWeek.THURSDAY
+                      s.startsWith("пт") || s.startsWith("пят") -> DayOfWeek.FRIDAY
+                      s.startsWith("сб") || s.startsWith("суб") -> DayOfWeek.SATURDAY
+                      s.startsWith("вс") || s.startsWith("вос") -> DayOfWeek.SUNDAY
+                      else -> null
+                  }
+              }
+
+              fun parse(text: String): List<Lesson> {
+                  val result = mutableListOf<Lesson>()
+                  for (rawLine in text.lines()) {
+                      val line = rawLine.trim()
+                      if (line.isEmpty() || line.startsWith("#")) continue
+                      val m = LINE.matchEntire(line) ?: continue
+                      val day = dayOf(m.groupValues[1]) ?: continue
+                      val start: LocalTime
+                      val end: LocalTime
+                      try {
+                          start = LocalTime.of(m.groupValues[2].toInt(), m.groupValues[3].toInt())
+                          end = LocalTime.of(m.groupValues[4].toInt(), m.groupValues[5].toInt())
+                      } catch (e: Exception) {
+                          continue
+                      }
+                      if (!end.isAfter(start)) continue
+                      val tokens = m.groupValues[6].trim().split(Regex("\\s+"))
+                      val subject: String
+                      val room: String
+                      if (tokens.size >= 2) {
+                          room = tokens.last().trim('(', ')')
+                          subject = tokens.dropLast(1).joinToString(" ")
+                      } else {
+                          subject = tokens[0]
+                          room = ""
+                      }
+                      result += Lesson(day, start, end, subject, room)
+                  }
+                  return result
+              }
+
+              /** Ближайший звонок: конец идущего урока или начало следующего. */
+              fun current(lessons: List<Lesson>, now: LocalDateTime): WidgetState? {
+                  if (lessons.isEmpty()) return null
+                  for (offset in 0..7) {
+                      val date = now.toLocalDate().plusDays(offset.toLong())
+                      val todays = lessons.filter { it.day == date.dayOfWeek }.sortedBy { it.start }
+                      for (l in todays) {
+                          val s = date.atTime(l.start)
+                          val e = date.atTime(l.end)
+                          if (now.isBefore(e)) {
+                              return if (!now.isBefore(s)) WidgetState(true, l, e, date)
+                              else WidgetState(false, l, s, date)
+                          }
+                      }
+                  }
+                  return null
+              }
+          }
+          __EOF__
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/ic_fg.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#8FD3FF"
+                  android:pathData="M54,30a24,24 0 1,0 0.01,0z" />
+              <path
+                  android:fillColor="#1F2335"
+                  android:pathData="M52,40h4v15l9,5l-2,3.5l-11,-6.5z" />
+          </vector>
+          __EOF__
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/widget_bg.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="#FF1F2335" />
+              <corners android:radius="22dp" />
+          </shape>
+          __EOF__
+          mkdir -p 'app/src/main/res/layout'
+          cat > 'app/src/main/res/layout/widget_lesson.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:gravity="center_vertical"
+              android:orientation="vertical"
+              android:padding="12dp">
+
+              <TextView
+                  android:id="@+id/label"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:maxLines="1"
+                  android:text="Следующий урок"
+                  android:textColor="#B0B8D0"
+                  android:textSize="11sp" />
+
+              <TextView
+                  android:id="@+id/subject"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:ellipsize="end"
+                  android:maxLines="2"
+                  android:text="Математика"
+                  android:textColor="#FFFFFF"
+                  android:textSize="17sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:id="@+id/room"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:maxLines="1"
+                  android:text="каб. 204"
+                  android:textColor="#8FD3FF"
+                  android:textSize="13sp" />
+
+              <TextView
+                  android:id="@+id/countdown"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="6dp"
+                  android:maxLines="1"
+                  android:textColor="#FFFFFF"
+                  android:textSize="24sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:id="@+id/hint"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:maxLines="1"
+                  android:text="до звонка"
+                  android:textColor="#B0B8D0"
+                  android:textSize="10sp" />
+          </LinearLayout>
+          __EOF__
+          mkdir -p 'app/src/main/res/mipmap-anydpi-v26'
+          cat > 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg" />
+              <foreground android:drawable="@drawable/ic_fg" />
+          </adaptive-icon>
+          __EOF__
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/colors.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_bg">#1F2335</color>
+          </resources>
+          __EOF__
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/strings.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Урок-виджет</string>
+              <string name="widget_name">Следующий урок</string>
+              <string name="widget_desc">Следующий урок, кабинет и время до звонка</string>
+          </resources>
+          __EOF__
+          mkdir -p 'app/src/main/res/xml'
+          cat > 'app/src/main/res/xml/lesson_widget_info.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/widget_desc"
+              android:initialLayout="@layout/widget_lesson"
+              android:minWidth="110dp"
+              android:minHeight="110dp"
+              android:resizeMode="none"
+              android:targetCellWidth="2"
+              android:targetCellHeight="2"
+              android:updatePeriodMillis="1800000"
+              android:widgetCategory="home_screen" />
+          __EOF__
+          cat > 'build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.0" apply false
+          }
+          __EOF__
+          cat > 'gradle.properties' <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          __EOF__
+          cat > 'settings.gradle.kts' <<'__EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LessonWidget"
+          include(":app")
+          __EOF__
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lesson-widget-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
